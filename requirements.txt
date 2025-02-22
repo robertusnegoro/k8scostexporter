@@ -1,0 +1,6 @@
+prometheus_client==0.21.1
+kubernetes==32.0.1
+google-cloud-billing==1.16.1
+google-cloud-compute==1.25.0
+cachetools==5.5.2
+tenacity==9.0.0
