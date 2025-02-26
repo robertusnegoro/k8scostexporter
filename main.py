@@ -15,78 +15,124 @@ import sys
 import traceback
 import signal
 from tenacity import retry, stop_after_attempt, wait_exponential
+from prometheus_api_client import PrometheusConnect
+
+# =============================================================================
+# Environment Configuration
+# =============================================================================
+class Config:
+    # Logging
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+    LOG_FILE = os.getenv("LOG_FILE", None)
+
+    # GCP Settings
+    PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+    REGION = os.getenv("GCP_REGION", "us-central1")
+    ZONE = os.getenv("GCP_ZONE", "us-central1-a")
+
+    # Kubernetes Settings
+    KUBE_CONTEXT = os.getenv("KUBE_CONTEXT", None)
+    IN_CLUSTER = os.getenv("IN_CLUSTER", "false").lower() == "true"
+    MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+
+    # Prometheus Settings
+    PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", None)
+    PRICE_UPDATE_INTERVAL = int(os.getenv("PRICE_UPDATE_INTERVAL", "30"))  # days
+
+    # Metric Names
+    SKU_PRICE_METRIC = 'k8s_cost_gcp_sku_price'
+
+    # Cache Settings
+    BILLING_CACHE_TTL = 3600  # 1 hour
+    PRICE_CACHE_TTL = 86400  # 24 hours
 
 # Setup logging
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_FILE = os.getenv("LOG_FILE", None)
-
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(levelname)s - %(message)s',
-    filename=LOG_FILE if LOG_FILE else None
+    filename=Config.LOG_FILE if Config.LOG_FILE else None
 )
 logger = logging.getLogger(__name__)
 
-# GCP Configuration
-PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-REGION = os.getenv("GCP_REGION", "us-central1")
-ZONE = os.getenv("GCP_ZONE", "us-central1-a")
+logger.info(f"Using GCP Project ID: {Config.PROJECT_ID}")
+logger.info(f"Using thread pool with {Config.MAX_WORKERS} workers")
 
-logger.info(f"Using GCP Project ID: {PROJECT_ID}")
+# Initialize caches
+billing_info_cache = TTLCache(maxsize=1, ttl=Config.BILLING_CACHE_TTL)
+# Initialize price cache only if needed (no Prometheus)
+price_cache = TTLCache(maxsize=100, ttl=Config.PRICE_CACHE_TTL) if not Config.PROMETHEUS_URL else None
 
-# Cache for pricing data (refresh every 24 hours)
-price_cache = TTLCache(maxsize=100, ttl=86400)  # 24 hours
-billing_info_cache = TTLCache(maxsize=1, ttl=3600)  # 1 hour
+# Load Kubernetes configuration
+try:
+    if Config.IN_CLUSTER:
+        config.load_incluster_config()
+        logger.info("Running inside Kubernetes cluster")
+    elif Config.KUBE_CONTEXT:
+        config.load_kube_config(context=Config.KUBE_CONTEXT)
+        logger.info(f"Using kube context: {Config.KUBE_CONTEXT}")
+    else:
+        # Try loading default config, fall back to local development mode if it fails
+        try:
+            config.load_kube_config()
+            logger.info("Using default kube context")
+        except config.config_exception.ConfigException as e:
+            logger.warning(f"Failed to load kubernetes config: {e}")
+            logger.warning("Running in local development mode - some features may be limited")
+            # Initialize dummy k8s clients that won't be used
+            v1 = None
+            v1_metrics = None
+            # Skip the rest of the kubernetes initialization
+            raise Exception("Skip k8s initialization")
 
-# Load Kubernetes configuration based on environment
-KUBE_CONTEXT = os.getenv("KUBE_CONTEXT", None)
-IN_CLUSTER = os.getenv("IN_CLUSTER", "false").lower() == "true"
+    # Initialize Kubernetes API clients
+    v1 = client.CoreV1Api()
+    v1_metrics = client.CustomObjectsApi()
 
-# Add near the top with other environment variables
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
-logger.info(f"Using thread pool with {MAX_WORKERS} workers")
+except Exception as e:
+    if str(e) != "Skip k8s initialization":
+        logger.error(f"Failed to initialize kubernetes clients: {e}")
+        logger.warning("Running in local development mode - some features may be limited")
+        v1 = None
+        v1_metrics = None
 
-if IN_CLUSTER:
-    config.load_incluster_config()
-    logger.info("Running inside Kubernetes cluster")
-elif KUBE_CONTEXT:
-    config.load_kube_config(context=KUBE_CONTEXT)
-    logger.info(f"Using kube context: {KUBE_CONTEXT}")
-else:
-    config.load_kube_config()
-    logger.info("Using default kube context")
-
-# Initialize GCP clients with project ID and quota project
+# Initialize GCP clients
 client_options = client_options.ClientOptions(
-    quota_project_id=PROJECT_ID
+    quota_project_id=Config.PROJECT_ID
 )
 
-billing_client = billing_v1.CloudBillingClient(
-    client_options=client_options
-)
-catalog_client = billing_v1.CloudCatalogClient(
-    client_options=client_options
-)
-compute_client = compute_v1.MachineTypesClient(
-    client_options=client_options
-)
+billing_client = billing_v1.CloudBillingClient(client_options=client_options)
+catalog_client = billing_v1.CloudCatalogClient(client_options=client_options)
+compute_client = compute_v1.MachineTypesClient(client_options=client_options)
 
-# Log the current credentials being used
+# Initialize Prometheus client only if URL is provided
+prom = None
+if Config.PROMETHEUS_URL:
+    prom = PrometheusConnect(url=Config.PROMETHEUS_URL, disable_ssl=True)
+    logger.info(f"Connected to Prometheus at {Config.PROMETHEUS_URL}")
+else:
+    logger.info("No Prometheus URL provided, using local cache for pricing data")
+
+# Log authentication details
 current_creds, project_id = google.auth.default()
 logger.info(f"Currently authenticated as: {current_creds.service_account_email if hasattr(current_creds, 'service_account_email') else 'unknown'}")
 logger.info(f"Default project from credentials: {project_id}")
-logger.info(f"Using quota project: {PROJECT_ID}")
+logger.info(f"Using quota project: {Config.PROJECT_ID}")
 
 # Define Prometheus metrics
-cpu_usage = Gauge('kube_pod_cpu_usage', 'CPU usage per pod', ['namespace', 'pod'])
-mem_usage = Gauge('kube_pod_memory_usage', 'Memory usage per pod', ['namespace', 'pod'])
-cpu_cost = Gauge('gcp_pod_cpu_cost_hour', 'Hourly CPU cost per pod', ['namespace', 'pod', 'region', 'machine_type'])
-mem_cost = Gauge('gcp_pod_memory_cost_hour', 'Hourly memory cost per pod', ['namespace', 'pod', 'region', 'machine_type'])
-total_cost = Gauge('gcp_pod_total_cost_hour', 'Total hourly cost per pod', ['namespace', 'pod', 'region', 'machine_type'])
+cpu_usage = Gauge('k8s_cost_pod_cpu_usage', 'CPU usage per pod', ['namespace', 'pod'])
+mem_usage = Gauge('k8s_cost_pod_memory_usage', 'Memory usage per pod', ['namespace', 'pod'])
+cpu_cost = Gauge('k8s_cost_pod_cpu_cost_hour', 'Hourly CPU cost per pod', ['namespace', 'pod', 'region', 'machine_type'])
+mem_cost = Gauge('k8s_cost_pod_memory_cost_hour', 'Hourly memory cost per pod', ['namespace', 'pod', 'region', 'machine_type'])
+total_cost = Gauge('k8s_cost_pod_total_cost_hour', 'Total hourly cost per pod', ['namespace', 'pod', 'region', 'machine_type'])
 
-# Initialize Kubernetes API clients
-v1 = client.CoreV1Api()
-v1_metrics = client.CustomObjectsApi()
+# Update SKU pricing gauge
+sku_price = Gauge('k8s_cost_gcp_sku_price', 'GCP SKU pricing information', 
+                 ['machine_type', 'region', 'resource_type'])
+
+# Update collector metrics
+collector_pods_processed = Gauge('k8s_cost_collector_pods_processed_total', 'Number of pods processed in current cycle')
+collector_pods_failed = Gauge('k8s_cost_collector_pods_failed_total', 'Number of pods that failed processing in current cycle')
+collector_processing_seconds = Gauge('k8s_cost_collector_processing_seconds', 'Time taken to process all pods')
 
 def get_node_machine_type(node_name):
     try:
@@ -123,57 +169,106 @@ def get_billing_info():
     skus = list(catalog_client.list_skus(parent=compute_service.name))
     return billing_account, compute_service, skus
 
-def get_machine_type_pricing(machine_type="e2-standard-2"):
-    cache_key = f"{REGION}-{machine_type}"
-    
-    # Check cache first
-    if cache_key in price_cache:
-        logger.debug(f"Cache hit: Found pricing for {machine_type} in region {REGION}")
-        return price_cache[cache_key]
-
-    logger.debug(f"Cache miss: Fetching pricing from GCP for {machine_type} in region {REGION}")
+def update_pricing_metrics():
+    """Update either Prometheus metrics or local cache with current GCP pricing"""
+    logger.info("Updating pricing data...")
     try:
-        # Get billing info with retries (now includes SKUs)
-        _, _, skus = get_billing_info()
+        machine_types = ["e2-standard-2", "e2-standard-4", "e2-standard-8"]
         
-        pricing = {
-            'cpu_hour': Decimal('0'),
-            'memory_gb_hour': Decimal('0')
-        }
-
-        machine_family = machine_type.split('-')[0]
-        
-        for sku in skus:
-            if (sku.category.resource_family == "Compute" and 
-                REGION in sku.service_regions and 
-                machine_family in sku.description.lower()):
+        for machine_type in machine_types:
+            try:
+                _, _, skus = get_billing_info()
+                machine_family = machine_type.split('-')[0]
                 
-                if "CPU" in sku.description:
-                    unit_price = (sku.pricing_info[0].pricing_expression.tiered_rates[0].unit_price.units + 
-                                sku.pricing_info[0].pricing_expression.tiered_rates[0].unit_price.nanos / 1e9)
-                    pricing['cpu_hour'] = Decimal(str(unit_price))
-                    logger.info(f"Found CPU pricing for {machine_type}: ${unit_price}/hour")
-                    
-                elif "RAM" in sku.description:
-                    unit_price = (sku.pricing_info[0].pricing_expression.tiered_rates[0].unit_price.units + 
-                                sku.pricing_info[0].pricing_expression.tiered_rates[0].unit_price.nanos / 1e9)
-                    pricing['memory_gb_hour'] = Decimal(str(unit_price))
-                    logger.info(f"Found RAM pricing for {machine_type}: ${unit_price}/GB/hour")
+                for sku in skus:
+                    if (sku.category.resource_family == "Compute" and 
+                        Config.REGION in sku.service_regions and 
+                        machine_family in sku.description.lower()):
+                        
+                        if "CPU" in sku.description:
+                            unit_price = (sku.pricing_info[0].pricing_expression.tiered_rates[0].unit_price.units + 
+                                        sku.pricing_info[0].pricing_expression.tiered_rates[0].unit_price.nanos / 1e9)
+                            
+                            if Config.PROMETHEUS_URL:
+                                # Update the Gauge metric
+                                sku_price.labels(
+                                    machine_type=machine_type,
+                                    region=Config.REGION,
+                                    resource_type="cpu_hour"
+                                ).set(unit_price)
+                            else:
+                                # Update local cache
+                                cache_key = f"{Config.REGION}-{machine_type}-cpu"
+                                price_cache[cache_key] = unit_price
+                                
+                            logger.info(f"Updated CPU pricing for {machine_type}: ${unit_price}/hour")
+                            
+                        elif "RAM" in sku.description:
+                            unit_price = (sku.pricing_info[0].pricing_expression.tiered_rates[0].unit_price.units + 
+                                        sku.pricing_info[0].pricing_expression.tiered_rates[0].unit_price.nanos / 1e9)
+                            
+                            if Config.PROMETHEUS_URL:
+                                # Update the Gauge metric
+                                sku_price.labels(
+                                    machine_type=machine_type,
+                                    region=Config.REGION,
+                                    resource_type="memory_gb_hour"
+                                ).set(unit_price)
+                            else:
+                                # Update local cache
+                                cache_key = f"{Config.REGION}-{machine_type}-memory"
+                                price_cache[cache_key] = unit_price
+                                
+                            logger.info(f"Updated RAM pricing for {machine_type}: ${unit_price}/GB/hour")
 
-        if pricing['cpu_hour'] == 0 or pricing['memory_gb_hour'] == 0:
-            logger.warning(f"Could not find complete pricing for {machine_type}, using defaults")
-            pricing = {
-                'cpu_hour': Decimal('0.042'),
-                'memory_gb_hour': Decimal('0.005')
-            }
-
-        # Cache the pricing
-        price_cache[cache_key] = pricing
-        logger.info(f"Cached pricing for {machine_type} in region {REGION}")
-        return pricing
+            except Exception as e:
+                logger.error(f"Failed to update pricing for {machine_type}: {e}")
+                # Set default prices
+                if Config.PROMETHEUS_URL:
+                    sku_price.labels(
+                        machine_type=machine_type,
+                        region=Config.REGION,
+                        resource_type="cpu_hour"
+                    ).set(0.042)
+                    sku_price.labels(
+                        machine_type=machine_type,
+                        region=Config.REGION,
+                        resource_type="memory_gb_hour"
+                    ).set(0.005)
+                else:
+                    price_cache[f"{Config.REGION}-{machine_type}-cpu"] = 0.042
+                    price_cache[f"{Config.REGION}-{machine_type}-memory"] = 0.005
 
     except Exception as e:
-        logger.error(f"Failed to fetch GCP pricing: {e}")
+        logger.error(f"Failed to update pricing data: {e}")
+
+def get_machine_type_pricing(machine_type="e2-standard-2"):
+    """Get pricing from either Prometheus metrics or local cache"""
+    try:
+        if Config.PROMETHEUS_URL:
+            # Get from Prometheus metrics
+            cpu_price = sku_price.labels(
+                machine_type=machine_type,
+                region=Config.REGION,
+                resource_type="cpu_hour"
+            )._value.get()
+            
+            memory_price = sku_price.labels(
+                machine_type=machine_type,
+                region=Config.REGION,
+                resource_type="memory_gb_hour"
+            )._value.get()
+        else:
+            # Get from local cache
+            cpu_price = price_cache.get(f"{Config.REGION}-{machine_type}-cpu")
+            memory_price = price_cache.get(f"{Config.REGION}-{machine_type}-memory")
+        
+        return {
+            'cpu_hour': Decimal(str(cpu_price if cpu_price is not None else 0.042)),
+            'memory_gb_hour': Decimal(str(memory_price if memory_price is not None else 0.005))
+        }
+    except Exception as e:
+        logger.error(f"Failed to get pricing: {e}")
         return {
             'cpu_hour': Decimal('0.042'),
             'memory_gb_hour': Decimal('0.005')
@@ -186,16 +281,26 @@ def calculate_costs(cpu_cores, memory_mib, namespace, pod_name, machine_type="e2
         cpu_hourly_cost = Decimal(str(cpu_cores)) * pricing["cpu_hour"]
         memory_hourly_cost = Decimal(str(memory_gb)) * pricing["memory_gb_hour"]
         total_hourly_cost = cpu_hourly_cost + memory_hourly_cost
-        cpu_cost.labels(namespace, pod_name, REGION, machine_type).set(float(cpu_hourly_cost))
-        mem_cost.labels(namespace, pod_name, REGION, machine_type).set(float(memory_hourly_cost))
-        total_cost.labels(namespace, pod_name, REGION, machine_type).set(float(total_hourly_cost))
+        cpu_cost.labels(namespace, pod_name, Config.REGION, machine_type).set(float(cpu_hourly_cost))
+        mem_cost.labels(namespace, pod_name, Config.REGION, machine_type).set(float(memory_hourly_cost))
+        total_cost.labels(namespace, pod_name, Config.REGION, machine_type).set(float(total_hourly_cost))
     except Exception as e:
         logger.error(f"Failed to calculate costs: {e}")
 
 def parse_memory_value(mem_value):
     """Convert memory value string to MiB"""
     try:
-        if mem_value.endswith('Ki'):
+        # Remove any whitespace
+        mem_value = mem_value.strip()
+        
+        # Handle CPU-style values (ending in 'u' or 'n')
+        if mem_value.endswith('u'):
+            return int(mem_value.rstrip('u')) / (1024 * 1024)  # Convert to MiB
+        elif mem_value.endswith('n'):
+            return int(mem_value.rstrip('n')) / (1024 * 1024 * 1e9)  # Convert nano to MiB
+        
+        # Handle memory units
+        elif mem_value.endswith('Ki'):
             return int(mem_value.rstrip('Ki')) / 1024  # Convert KiB to MiB
         elif mem_value.endswith('Mi'):
             return int(mem_value.rstrip('Mi'))  # Already in MiB
@@ -244,9 +349,9 @@ def fetch_pod_metrics(pod):
             try:
                 cpu_usage.remove(namespace, pod_name)
                 mem_usage.remove(namespace, pod_name)
-                cpu_cost.remove(namespace, pod_name, REGION, machine_type)
-                mem_cost.remove(namespace, pod_name, REGION, machine_type)
-                total_cost.remove(namespace, pod_name, REGION, machine_type)
+                cpu_cost.remove(namespace, pod_name, Config.REGION, machine_type)
+                mem_cost.remove(namespace, pod_name, Config.REGION, machine_type)
+                total_cost.remove(namespace, pod_name, Config.REGION, machine_type)
             except KeyError:
                 # Metrics might already be removed
                 pass
@@ -265,22 +370,79 @@ def collect_metrics():
     signal.signal(signal.SIGTERM, signal_handler)
     
     logger.info("Starting metrics collection. Press CTRL+C to exit.")
+    
+    # Initial price update
+    update_pricing_metrics()
+    last_price_update = datetime.now(timezone.utc)
+    
     while True:
         try:
-            pods = v1.list_pod_for_all_namespaces(watch=False).items
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                executor.map(fetch_pod_metrics, pods)
+            # Check if it's time to update prices
+            now = datetime.now(timezone.utc)
+            if (now - last_price_update).days >= Config.PRICE_UPDATE_INTERVAL:
+                update_pricing_metrics()
+                last_price_update = now
+            
+            # Only collect pod metrics if kubernetes is configured
+            if v1 and v1_metrics:
+                pods = v1.list_pod_for_all_namespaces(watch=False).items
+                total_pods = len(pods)
+                processed_pods = 0
+                failed_pods = 0
+                start_time = time.time()
+
+                logger.info(f"Starting metrics collection for {total_pods} pods...")
+
+                def process_pod_with_progress(pod):
+                    nonlocal processed_pods, failed_pods
+                    try:
+                        fetch_pod_metrics(pod)
+                        processed_pods += 1
+                        if processed_pods % 100 == 0:  # Log every 100 pods
+                            elapsed = time.time() - start_time
+                            rate = processed_pods / elapsed
+                            remaining = (total_pods - processed_pods) / rate if rate > 0 else 0
+                            logger.info(
+                                f"Progress: {processed_pods}/{total_pods} pods processed "
+                                f"({(processed_pods/total_pods)*100:.1f}%) - "
+                                f"Rate: {rate:.1f} pods/sec - "
+                                f"Est. remaining: {remaining:.1f} seconds"
+                            )
+                    except Exception as e:
+                        failed_pods += 1
+                        logger.error(f"Failed to process pod {pod.metadata.namespace}/{pod.metadata.name}: {e}")
+
+                with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+                    executor.map(process_pod_with_progress, pods)
+
+                # Final statistics
+                total_time = time.time() - start_time
+                logger.info(
+                    f"Metrics collection completed in {total_time:.1f} seconds:\n"
+                    f"- Total pods: {total_pods}\n"
+                    f"- Successfully processed: {processed_pods}\n"
+                    f"- Failed: {failed_pods}\n"
+                    f"- Average rate: {processed_pods/total_time:.1f} pods/sec"
+                )
+
+                # Update collector metrics
+                collector_pods_processed.set(processed_pods)
+                collector_pods_failed.set(failed_pods)
+                collector_processing_seconds.set(total_time)
+
+            else:
+                logger.debug("Skipping pod metrics collection - kubernetes not configured")
+            
             time.sleep(10)
         except KeyboardInterrupt:
             logger.info("Interrupted by user. Shutting down...")
             break
         except Exception as e:
             logger.error(f"Error in metrics collection: {e}")
-            time.sleep(10)  # Wait before retrying
+            time.sleep(10)
 
 if __name__ == "__main__":
     logger.info("Starting metrics server...")
     start_http_server(8000)
     collect_metrics()
     logger.info("Shutdown complete.")
-
