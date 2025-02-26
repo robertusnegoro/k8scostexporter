@@ -39,6 +39,9 @@ class Config:
     PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", None)
     PRICE_UPDATE_INTERVAL = int(os.getenv("PRICE_UPDATE_INTERVAL", "30"))  # days
 
+    # Collection Settings
+    COLLECTION_INTERVAL = int(os.getenv("COLLECTION_INTERVAL", "300"))  # seconds, defaults to 5 minutes
+
     # Metric Names
     SKU_PRICE_METRIC = 'k8s_cost_gcp_sku_price'
 
@@ -369,7 +372,7 @@ def collect_metrics():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    logger.info("Starting metrics collection. Press CTRL+C to exit.")
+    logger.info(f"Starting metrics collection with {Config.COLLECTION_INTERVAL} seconds interval")
     
     # Initial price update
     update_pricing_metrics()
@@ -377,6 +380,8 @@ def collect_metrics():
     
     while True:
         try:
+            collection_start = time.time()
+            
             # Check if it's time to update prices
             now = datetime.now(timezone.utc)
             if (now - last_price_update).days >= Config.PRICE_UPDATE_INTERVAL:
@@ -433,13 +438,26 @@ def collect_metrics():
             else:
                 logger.debug("Skipping pod metrics collection - kubernetes not configured")
             
-            time.sleep(10)
+            # Calculate sleep time based on collection duration
+            collection_duration = time.time() - collection_start
+            sleep_time = max(0, Config.COLLECTION_INTERVAL - collection_duration)
+            
+            if sleep_time > 0:
+                logger.debug(f"Waiting {sleep_time:.1f} seconds until next collection cycle...")
+                time.sleep(sleep_time)
+            else:
+                logger.warning(
+                    f"Collection took longer than interval "
+                    f"({collection_duration:.1f} > {Config.COLLECTION_INTERVAL} seconds). "
+                    "Starting next cycle immediately."
+                )
+                
         except KeyboardInterrupt:
             logger.info("Interrupted by user. Shutting down...")
             break
         except Exception as e:
             logger.error(f"Error in metrics collection: {e}")
-            time.sleep(10)
+            time.sleep(Config.COLLECTION_INTERVAL)  # On error, wait full interval
 
 if __name__ == "__main__":
     logger.info("Starting metrics server...")
